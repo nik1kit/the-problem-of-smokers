@@ -45,6 +45,11 @@ class Table:
        - try_take(own_ingredient): курильщик проверяет,
          может ли он взять ингредиенты и начать курить.
        - finish_smoking(own_ingredient): вызывается по завершению курения, чтобы снять флаг "курит".
+
+       О семафорах:
+       Самое гавное: НЕ РАБОТЕТ С КОНТЕКСТНЫМ МЕНЕДЖЕРОМ with
+       acquire() - ждёт, пока ресурс станет свободен, а затем захватывает его
+       release() - освобождает ресурс, чтобы его могли занять
        """
     def __init__(self):
         """
@@ -54,8 +59,11 @@ class Table:
         self.smoker_status — кто из курильщиков сейчас курит
         self.table_busy — есть ли что-то на столе.
         """
-        self.lock = threading.Lock()
-        self.condition = threading.Condition(self.lock)
+
+        self.table_mutex = threading.Semaphore(1)  # семафор — стол может быть занят только одним
+        self.agent_sem = threading.Semaphore(1)  # агент может положить ингредиенты(стол свободен)
+        self.smoker_sem = threading.Semaphore(0)  # семафор, чтобы будить всех курильщиков
+
         self.ingredients = []
         self.smoker_status = {ingredient: False for ingredient in INGREDIENTS}
         self.table_busy = False
@@ -66,13 +74,15 @@ class Table:
         :param first: первый ингридиент
         :param second: второй ингридиент
         """
-        with self.condition:
-            while self.table_busy:
-                self.condition.wait()
+        # агент не может положить ингредиенты, пока предыдущий набор не убран
+        self.agent_sem.acquire()  # pylint: disable=consider-using-with
+        # гарантирует, что только один поток может менять содержимое стола
+        with self.table_mutex:
             self.ingredients = [first, second]
             self.table_busy = True
             print(f"Агент кладёт: {first} и {second}")
-            self.condition.notify_all()  # уведомляет курильщиков, что ингридиенты на столе
+        # будим одного из курильщиков
+        self.smoker_sem.release()
 
     def try_take(self, own_ingredient):
         """
@@ -80,23 +90,19 @@ class Table:
         :param own_ingredient: один из ингридиентов(табак, бумага, спички)
         :return:
         """
-        with self.condition:  # только один поток может здесь находиться одновременно
-            needed = set(INGREDIENTS) - {own_ingredient}  # два недостающих ингридиента
+        with self.table_mutex:
+            needed = set(INGREDIENTS) - {own_ingredient}
             if (
-                set(self.ingredients) == needed
-                and not self.smoker_status[own_ingredient]
-            ):  # есть ингридиенты и курильщик не курит
-                print(
-                    f"Курильщик с {own_ingredient} берёт ингредиенты и начинает курить"
-                )
+                    set(self.ingredients) == needed
+                    and not self.smoker_status[own_ingredient]
+            ):
+                print(f"Курильщик с {own_ingredient} берёт ингредиенты и начинает курить")
                 self.ingredients = []
-                self.table_busy = (
-                    False  # <- СТОЛ СТАЛ ПУСТЫМ — агент может действовать!
-                )
+                self.table_busy = False
                 self.smoker_status[own_ingredient] = True
-                self.condition.notify_all()
+                self.agent_sem.release()
                 return True
-            return False
+        return False
 
     def finish_smoking(self, own_ingredient):
         """
@@ -105,10 +111,10 @@ class Table:
         уведомляем всех, что кто-то освободился
         :param own_ingredient: один из ингридиентов(табак, бумага, спички)
         """
-        with self.condition:
+        with self.table_mutex:
             print(f"Курильщик с {own_ingredient} закончил курить")
             self.smoker_status[own_ingredient] = False
-            self.condition.notify_all()
+        self.smoker_sem.release()
 
 
 def agent(table: Table):
@@ -138,8 +144,15 @@ def smoker(table: Table, own_ingredient: str):
 
     # Проверяет, можно ли взять ингридиенты
     while True:
+        table.smoker_sem.acquire()  # подождать, когда кто-то положит ингредиенты
+
         if table.try_take(own_ingredient):
             threading.Thread(target=smoke, daemon=True).start()
+        else:
+            # если ингредиенты не подошли или он курит — вернуть семафор,
+            # чтобы другие курильщики попробовали
+            table.smoker_sem.release()
+
         time.sleep(1)
 
 
@@ -158,8 +171,8 @@ def main():
         threading.Thread(target=smoker, args=(table, "спички"), daemon=True),
     ]
 
-    for t in threads:
-        t.start()
+    for thread in threads:
+        thread.start()
 
     while True:
         time.sleep(2)
